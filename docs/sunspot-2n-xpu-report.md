@@ -172,4 +172,26 @@ Archived logs: `/tmp/sunspot_2n.o12482179` (24 KB), `/tmp/sunspot_2n.o12482181` 
 qsub /home/foremans/thammer_xpu_2n.pbs
 # or from UAN: mpiexec -n 12 --ppn 12 python3 /home/foremans/thammer-xpu-2n/torch-hammer.py ...
 ```
+## Final: 12482204 — 24 GPUs × 5 benchmarks (all-GPUs, fixed)
 
+**Job:** `12482204` (single-rank 9 benches + 2×12 tiles via `mpiexec --all-gpus`, 100s walltime), `2.13.0a0+gitcf30153`, `Intel(R) Data Center GPU Max 1550`.
+
+**Fleet report** via `reports/hammer_report.py` (built-in):
+
+```
+TORCH HAMMER -- FLEET REPORT -- Sunspot -- 2N XPU 24 GPUs x 5 benches (all-GPUs)
+  Nodes:      2 (x1922c6s4b0n0, x1922c6s6b0n0)  GPU Model: Intel(R) Data Center GPU Max 1550
+  GPUs:       24 total  Benchmarks: 5  Rows: 120  Threshold: 15.0%
+  Batched GEMM (float32)       15.8 TFLOP/s  CV 0.9%  --  --  N=24
+  Convolution (float32)   46,026,495 img/s   CV 1.0%
+  3D FFT (float32)             260.6 GFLOP/s CV 0.8%
+  Einsum Attention (float32)    13.3 TFLOP/s CV 0.9%
+  Memory Traffic (float32)       0.2 GB/s    CV 2.7%
+  Node x1922c6s4b0n0  12 GPUs 60 tests PASS
+  Node x1922c6s6b0n0  12 GPUs 60 tests PASS
+  No outliers detected  FLEET VERDICT: 2/2 PASS | 0 WARN
+```
+
+Single-tile 9-bench run in same job: `Batched GEMM 17.0 TFLOP/s, Convolution 53.5M img/s, 3D FFT 292.9 GFLOP/s, Einsum 13.6 TFLOP/s, Memory 0.3 GB/s, Heat 149.5 MLUPS, Schrödinger 8752 iter/s, Atomic 986 Mops/s, Sparse 2.0 TFLOP/s` — `reports/hammer_report.py` HTML at `~/thammer-xpu-2n/all-benchmarks/fleet-report.html` (59 KB).
+
+Bugs fixed in this branch: `NameError: self.device` → `dev` (13 sites in `run_single_gpu`/Timer/atomic/sparse) committed as `5ba42e7`; Phase 3 `--log-dir` race (host-FQDN mismatch on shared `/home`) fixed in `thammer_xpu_full.pbs` (drop `--log-dir` from all-GPUs path; use `--compact`/`--csv-output`/`--json-output` which drive `hammer_report.py`).
