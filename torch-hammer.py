@@ -1856,7 +1856,7 @@ class Timer:
             self.e.synchronize()
             # Explicit sync for ROCm/HIP - events don't imply host sync like CUDA
             if getattr(torch.version, "hip", None):
-                _synchronize(self.device)
+                _synchronize(dev)
             # XPU events also benefit from explicit device synchronize on some drivers
             if self.device.type == "xpu" and hasattr(torch, "xpu"):
                 try:
@@ -4813,7 +4813,7 @@ def atomic_contention_test(a, dev, log, tel, tel_thread, prn):
             target.zero_()
             target.scatter_add_(0, indices, src)
             if _is_accelerator(dev):
-                _synchronize(self.device)
+                _synchronize(dev)
         log.info(f"[{dev_lbl} Atomic] Starting timed iterations...")
         
         tel_thread.set_active(True)
@@ -4954,7 +4954,7 @@ def sparse_mm_test(a, dev, log, tel, tel_thread, prn):
             log.info(f"[{dev_lbl} Sparse MM] Warmup iteration {wi+1}/{a.warmup}...")
             _ = torch.sparse.mm(sparse_A, dense_B)
             if _is_accelerator(dev):
-                _synchronize(self.device)
+                _synchronize(dev)
         log.info(f"[{dev_lbl} Sparse MM] Warmup complete, starting timed iterations...")
         
         # Effective FLOPS: 2 * nnz * N (each non-zero contributes 2 ops per output column)
@@ -5946,7 +5946,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5980,7 +5980,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -6013,7 +6013,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -6042,7 +6042,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -6071,7 +6071,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -6098,7 +6098,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -6127,7 +6127,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -6152,7 +6152,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -6179,7 +6179,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -6208,7 +6208,7 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     # Free accelerator memory
                     if _is_accelerator(dev):
                         _empty_cache(dev)
-                        _synchronize(self.device)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
