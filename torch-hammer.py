@@ -1153,7 +1153,15 @@ class IntelTelemetry(TelemetryBase):
         import socket
         self.idx = index
         self.hostname = socket.gethostname().split('.', 1)[0]
+        # xpu-smi lives in spack on Aurora/Sunspot; try which + known spack paths
         self._xpu_smi = shutil.which("xpu-smi")
+        if not self._xpu_smi:
+            for cand in ("/opt/aurora/26.181.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.3.5-vbpc5vu/bin/xpu-smi",
+                         "/opt/aurora/26.26.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.3.5-yg43zwe/bin/xpu-smi",
+                         "/opt/aurora/26.181.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.2.43-d4w7vpf/bin/xpu-smi"):
+                if __import__("os").path.exists(cand):
+                    self._xpu_smi = cand
+                    break
         self._model = "Intel_GPU"
         self._serial = "N/A"
         self._has_torch_xpu = False
@@ -1537,9 +1545,24 @@ class CpuTelemetry(TelemetryBase):
 
 # ── Factory selecting best available backend ───────────────────────────
 def make_telemetry(index: int, device: torch.device) -> TelemetryBase:
-    # Prefer xpu-smi when present regardless of discovery order; IntelTelemetry
-    # itself falls back to torch.xpu / sysfs when xpu-smi is absent.
-    if shutil.which("xpu-smi"):
+    # Prefer Intel path when xpu-smi or torch.xpu is present; IntelTelemetry
+    # itself falls back through torch.xpu / sysfs when xpu-smi is absent.
+    def _xpu_smi_present():
+        if shutil.which("xpu-smi"):
+            return True
+        import os as _os
+        for _cand in ("/opt/aurora/26.181.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.3.5-vbpc5vu/bin/xpu-smi",
+                     "/opt/aurora/26.26.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.3.5-yg43zwe/bin/xpu-smi"):
+            if _os.path.exists(_cand):
+                return True
+        try:
+            import torch as _t
+            if hasattr(_t, "xpu") and _t.xpu.is_available():
+                return True
+        except Exception:
+            pass
+        return False
+    if _xpu_smi_present():
         try:
             return IntelTelemetry(index)
         except Exception as e:
@@ -1861,7 +1884,7 @@ def _format_telemetry_compact(tel_data: Dict[str, Any]) -> str:
     model = tel_data.get('model', '')
     
     # Determine appropriate label
-    if vendor in ('NVIDIA Corporation', 'Advanced Micro Devices, Inc. [AMD/ATI]', 'NVIDIA', 'AMD'):
+    if vendor in ('NVIDIA Corporation', 'Advanced Micro Devices, Inc. [AMD/ATI]', 'NVIDIA', 'AMD', 'Intel'):
         parts.append(f"GPU{device_id}")
     elif vendor in ('CPU', 'GenuineIntel', 'AuthenticAMD') or \
          'arm' in model.lower() or 'x86' in model.lower() or \
