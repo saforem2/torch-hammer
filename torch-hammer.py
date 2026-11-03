@@ -133,6 +133,62 @@ warnings.filterwarnings(
 
 import torch
 
+# ── XPU / accelerator helpers ──
+_ACCELERATOR_TYPES = {"cuda", "xpu"}
+
+def _is_accelerator(device) -> bool:
+    """True for GPU-like devices that need events, sync and cache flush."""
+    return getattr(device, "type", "") in _ACCELERATOR_TYPES
+
+def _xpu_available() -> bool:
+    try:
+        return hasattr(torch, "xpu") and torch.xpu.is_available()
+    except Exception:
+        return False
+
+def _empty_cache(device) -> None:
+    _t = getattr(device, "type", "")
+    try:
+        if _t == "cuda":
+            torch.cuda.empty_cache()
+        elif _t == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.empty_cache()
+    except Exception:
+        pass
+
+def _synchronize(device=None) -> None:
+    """Synchronize the given device (or current CUDA/XPU device if None)."""
+    t = getattr(device, "type", None) if device is not None else None
+    try:
+        if t == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize()
+        elif t == "cuda" or device is None:
+            if hasattr(torch, "cuda"):
+                torch.cuda.synchronize()
+            if t == "xpu" and hasattr(torch, "xpu"):
+                torch.xpu.synchronize()
+        # also handle device is None but xpu is the active backend
+        if device is None and _xpu_available():
+            try:
+                torch.xpu.synchronize()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _mem_get_info(device):
+    """Return (free_bytes, total_bytes) for cuda/xpu, raising on failure."""
+    _t = getattr(device, "type", "")
+    if _t == "xpu" and hasattr(torch, "xpu"):
+        return torch.xpu.mem_get_info(device)
+    return torch.cuda.mem_get_info(getattr(device, "index", None))
+
+def _get_device_properties(device):
+    t = getattr(device, "type", "")
+    if t == "xpu" and hasattr(torch, "xpu"):
+        return torch.xpu.get_device_properties(device)
+    return torch.cuda.get_device_properties(getattr(device, "index", 0))
+
 # ───────────────────────────────────────────────────────────────────────
 # ASCII BANNER  ─────────────────────────────────────────────────────────
 TORCH_HAMMER_BANNER = r'''
@@ -1069,20 +1125,405 @@ class RocmTelemetry(TelemetryBase):
 
 
 
-# ── Intel dGPU (Placeholder) ─────────────────────────────────────────
+# ── Intel XPU (xpu-smi / Level Zero) ─────────────────────────────────
+# Data Center GPU Flex / Max / Arc.  Tries, in order:
+#   1. xpu-smi stats --json  (util, power, temp, freq, mem)
+#   2. xpu-smi discovery --json (model / serial / uuid)
+#   3. torch.xpu.get_device_properties / mem_get_info (fallback)
+#   4. sysfs (Xe/i915): /sys/class/drm/cardN/device/hwmon + /sys/class/intel_pmt
+# Every field degrades to "N/A" so CSV columns stay aligned.
 class IntelTelemetry(TelemetryBase):
+    supported = [
+        "hostname", "vendor", "model", "device_id", "serial",
+        "sm_util", "mem_util", "gpu_clock", "mem_clock", "power_W", "temp_gpu_C",
+        "mem_used_MB", "mem_total_MB", "mem_free_MB", "throttled",
+    ]
+
+    # xpu-smi JSON keys vary by generation; normalize both spellings
+    _POWER_KEYS = ("GPU Power (W)", "power", "power_draw_w", "power_W")
+    _TEMP_KEYS = ("GPU Core Temperature (C)", "GPU Temperature (C)", "temperature", "temp_gpu_C")
+    _FREQ_KEYS = ("GPU Frequency (MHz)", "frequency", "gpu_clock", "clock_MHz")
+    _UTIL_KEYS = ("GPU Utilization (%)", "Compute Engine Util (%)", "utilization", "sm_util")
+    _MEM_USED_KEYS = ("GPU Memory Used (MiB)", "memory_used", "mem_used_MB")
+    _MEM_TOTAL_KEYS = ("Memory Physical Size", "memory_total", "mem_total_MB")
+    _MODEL_KEYS = ("Device Name", "device_name", "model", "name")
+    _SERIAL_KEYS = ("Serial Number", "serial_number", "serial")
+
     def __init__(self, index):
         import socket
         self.idx = index
         self.hostname = socket.gethostname().split('.', 1)[0]
+        # xpu-smi lives in spack on Aurora/Sunspot; try which + known spack paths
+        self._xpu_smi = shutil.which("xpu-smi")
+        if not self._xpu_smi:
+            for cand in ("/opt/aurora/26.181.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.3.5-vbpc5vu/bin/xpu-smi",
+                         "/opt/aurora/26.26.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.3.5-yg43zwe/bin/xpu-smi",
+                         "/opt/aurora/26.181.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.2.43-d4w7vpf/bin/xpu-smi"):
+                if __import__("os").path.exists(cand):
+                    self._xpu_smi = cand
+                    break
+        self._model = "Intel_GPU"
+        self._serial = "N/A"
+        self._has_torch_xpu = False
+        # readings for get_stats() / check_thermal_warnings()
+        self.readings = {
+            'temp_gpu_C': [], 'power_W': [], 'gpu_clock': [],
+            'sm_util': [], 'mem_util': [], 'mem_used_MB': [],
+        }
+        self.throttle_detected = False
+        self.throttle_count = 0
+        self.power_limit_W = None
+        # Populate static fields (model/serial) once
+        self._load_static_info()
+        # Detect torch.xpu availability without importing heavy path
+        try:
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                self._has_torch_xpu = True
+                # Try to enrich model name from torch
+                try:
+                    props = torch.xpu.get_device_properties(self.idx)
+                    name = getattr(props, "name", None)
+                    if name:
+                        self._model = name
+                except Exception:
+                    pass
+                # Try memory total from torch
+                try:
+                    _, total = torch.xpu.mem_get_info(self.idx)
+                    self._torch_total_MB = total / 1024**2
+                except Exception:
+                    self._torch_total_MB = None
+                else:
+                    self._torch_total_MB = None
+        except Exception:
+            pass
+        # Power limit (best effort)
+        self._load_power_limit()
+
+    def _load_static_info(self):
+        if not self._xpu_smi:
+            return
+        # Best effort: prefer JSON; fall back silently
+        for cmd in [
+            ["xpu-smi", "discovery", "-d", str(self.idx), "-j"],
+            ["xpu-smi", "discovery", "--dump", "1,2,5", "-j"],
+        ]:
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                if out.returncode != 0 or not out.stdout.strip():
+                    continue
+                data = __import__("json").loads(out.stdout)
+                # xpu-smi discovery -j: {"device_list": [...]}
+                devs = data.get("device_list") or data.get("devices") or ([data] if isinstance(data, dict) and "device_name" in data else [])
+                if not devs:
+                    continue
+                # pick matching device_id or first
+                dev = next((d for d in devs if str(d.get("device_id", d.get("id", ""))) == str(self.idx)), devs[0])
+                for k in self._MODEL_KEYS:
+                    if dev.get(k):
+                        self._model = str(dev[k]).strip()
+                        break
+                for k in self._SERIAL_KEYS:
+                    v = dev.get(k)
+                    if v and str(v).strip().lower() not in ("", "unknown", "n/a"):
+                        self._serial = str(v).strip()
+                        break
+                # also try UUID as serial fallback
+                if self._serial == "N/A":
+                    for uk in ("uuid", "UUID"):
+                        if dev.get(uk):
+                            self._serial = str(dev[uk]).strip()
+                            break
+                break
+            except Exception:
+                continue
+        # sysfs fallback for model name: /sys/class/drm/cardN/device/uevent
+        if self._model == "Intel_GPU":
+            try:
+                for card in (f"card{self.idx}", f"renderD{128+self.idx}"):
+                    p = f"/sys/class/drm/{card}/device/uevent"
+                    if os.path.exists(p):
+                        with open(p) as f:
+                            for line in f:
+                                if line.startswith("DRIVER=") or "PRODUCT" in line or "PCI_ID" in line:
+                                    pass
+                        break
+            except Exception:
+                pass
+
+    def _load_power_limit(self):
+        if not self._xpu_smi:
+            return
+        try:
+            out = subprocess.run(["xpu-smi", "config", "-d", str(self.idx), "-j"], capture_output=True, text=True, timeout=3)
+            if out.returncode == 0:
+                data = __import__("json").loads(out.stdout)
+                # power limit lives under various keys
+                for k in ("Power Limit (w)", "power_limit", "power_limit_w"):
+                    if k in str(data):
+                        # brute force search
+                        import re as _re
+                        m = _re.search(rf'"{ _re.escape(k)}"\s*[:]\s*([0-9.]+)', out.stdout)
+                        if m:
+                            self.power_limit_W = float(m.group(1))
+                            break
+        except Exception:
+            pass
+
+    def _pick(self, data: dict, keys, default="N/A"):
+        for k in keys:
+            if k in data and data[k] not in (None, "", "N/A", "unknown"):
+                return data[k]
+        return default
+
+    def _parse_xpu_smi_stats(self):
+        """Return dict from xpu-smi stats -j or {} on failure."""
+        if not self._xpu_smi:
+            return {}
+        # Try per-device JSON
+        for cmd in [
+            ["xpu-smi", "stats", "-d", str(self.idx), "-j"],
+            ["xpu-smi", "dump", "-d", str(self.idx), "-m", "0,1,2,3,5,18", "-n", "1", "-j"],
+        ]:
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+                if out.returncode != 0 or not out.stdout.strip():
+                    continue
+                data = __import__("json").loads(out.stdout)
+                # stats -j returns {"device_list": [{"stats": {...}}]} or flat dict
+                if isinstance(data, dict):
+                    if "device_list" in data and data["device_list"]:
+                        data = data["device_list"][0].get("stats", data["device_list"][0])
+                    if "stats" in data:
+                        data = data["stats"]
+                if isinstance(data, dict) and data:
+                    return data
+            except Exception:
+                continue
+        return {}
+
+    def _read_sysfs(self):
+        """Fallback: read hwmon + drm sysfs for power/temp/freq."""
+        vals = {}
+        # hwmon: /sys/class/drm/cardN/device/hwmon/hwmon*/
+        for card in (f"card{self.idx}", f"renderD{128+self.idx}"):
+            base = f"/sys/class/drm/{card}/device"
+            if not os.path.isdir(base):
+                continue
+            # hwmon
+            try:
+                hwmon_base = os.path.join(base, "hwmon")
+                if os.path.isdir(hwmon_base):
+                    for h in os.listdir(hwmon_base):
+                        hp = os.path.join(hwmon_base, h)
+                        # power1_average is microwatts on Xe
+                        for pn in ("power1_average", "power1_input"):
+                            pf = os.path.join(hp, pn)
+                            if os.path.exists(pf):
+                                with open(pf) as f:
+                                    vals["power_W"] = int(f.read().strip()) / 1e6
+                                break
+                        for tn in ("temp1_input", "temp2_input"):
+                            tf = os.path.join(hp, tn)
+                            if os.path.exists(tf):
+                                with open(tf) as f:
+                                    vals["temp_gpu_C"] = int(f.read().strip()) / 1000.0
+                                break
+                        # freq: freq1_input is Hz on Xe
+                        for fn in ("freq1_input", "freq2_input"):
+                            ff = os.path.join(hp, fn)
+                            if os.path.exists(ff):
+                                with open(ff) as f:
+                                    vals["gpu_clock"] = int(f.read().strip()) / 1e6
+                                break
+            except Exception:
+                pass
+            # drm mem info: /sys/class/drm/cardN/device/mem_info_*_used etc (Xe)
+            try:
+                for mf in ("mem_info_vram_used", "mem_info_vram_total"):
+                    fp = os.path.join(base, mf)
+                    if os.path.exists(fp):
+                        with open(fp) as f:
+                            key = "mem_used_MB" if "used" in mf else "mem_total_MB"
+                            vals[key] = int(f.read().strip()) / 1024**2
+            except Exception:
+                pass
+            if vals:
+                break
+        return vals
 
     def read(self):
+        # Attempt xpu-smi snapshot
+        stats = self._parse_xpu_smi_stats()
+        sysfs = {} if stats else self._read_sysfs()
+
+        def _num(v):
+            if isinstance(v, (int, float)):
+                return v
+            if isinstance(v, str):
+                # values like "Engine 0: 12" or "0; Engine 0: 0"
+                import re as _re
+                m = _re.search(r"([0-9]+(?:\.[0-9]+)?)", v)
+                if m:
+                    try:
+                        return float(m.group(1))
+                    except Exception:
+                        pass
+            return "N/A"
+
+        # Power
+        power = self._pick(stats, self._POWER_KEYS, None)
+        if power is None:
+            power = sysfs.get("power_W", "N/A")
+        else:
+            power = _num(power)
+
+        # Temp
+        temp = self._pick(stats, self._TEMP_KEYS, None)
+        if temp is None:
+            temp = sysfs.get("temp_gpu_C", "N/A")
+        else:
+            temp = _num(temp)
+            # xpu-smi sometimes reports 0 when sensor unavailable
+            if temp == 0:
+                temp = sysfs.get("temp_gpu_C", "N/A")
+
+        # Frequency
+        freq = self._pick(stats, self._FREQ_KEYS, None)
+        if freq is None:
+            freq = sysfs.get("gpu_clock", "N/A")
+        else:
+            freq = _num(freq)
+            if freq == 0:
+                freq = sysfs.get("gpu_clock", "N/A")
+
+        # Utilization
+        util = self._pick(stats, self._UTIL_KEYS, "N/A")
+        util = _num(util) if util != "N/A" else "N/A"
+
+        # Memory
+        mem_used = self._pick(stats, self._MEM_USED_KEYS, None)
+        if mem_used is not None:
+            mem_used = _num(mem_used)
+            # MiB already; normalize N/A
+            if isinstance(mem_used, (int, float)) and mem_used > 1e6:
+                mem_used = mem_used / 1024**2  # bytes -> MiB
+        else:
+            mem_used = sysfs.get("mem_used_MB", "N/A")
+        # torch fallback for mem total/used
+        mem_total = self._pick(stats, self._MEM_TOTAL_KEYS, None)
+        if mem_total is not None:
+            mem_total = _num(mem_total)
+            if isinstance(mem_total, (int, float)) and mem_total > 1e6:
+                mem_total = mem_total / 1024**2
+        # override with torch total if available and more reliable
+        if hasattr(self, "_torch_total_MB") and self._torch_total_MB:
+            mem_total = self._torch_total_MB
+        if mem_total is None or mem_total == "N/A":
+            mem_total = getattr(self, "_torch_total_MB", None) or sysfs.get("mem_total_MB", "N/A")
+            if mem_total is None:
+                mem_total = "N/A"
+        if isinstance(mem_used, (int, float)) and isinstance(mem_total, (int, float)):
+            mem_free = mem_total - mem_used
+        else:
+            mem_free = "N/A"
+        mem_util = "N/A"
+        if isinstance(mem_used, (int, float)) and isinstance(mem_total, (int, float)) and mem_total > 0:
+            mem_util = round(mem_used / mem_total * 100)
+
+        # Throttle: xpu-smi health throttle reason or stats throttle bitmask
+        throttled = 0
+        thermal_slowdown = 0
+        if stats:
+            # dump metric 35 is throttle reason (bitmask)
+            thr = stats.get("Throttle reason", stats.get("throttle_reason", stats.get("throttle", 0)))
+            try:
+                if int(float(str(thr).split()[0])) != 0:
+                    throttled = 1
+                    thermal_slowdown = 1
+                    self.throttle_detected = True
+                    self.throttle_count += 1
+            except Exception:
+                pass
+
+        # Accumulate for get_stats()
+        if isinstance(util, (int, float)):
+            self.readings['sm_util'].append(util)
+        if isinstance(mem_util, (int, float)):
+            self.readings['mem_util'].append(mem_util)
+        if isinstance(freq, (int, float)):
+            self.readings['gpu_clock'].append(freq)
+        if isinstance(power, (int, float)):
+            self.readings['power_W'].append(power)
+        if isinstance(temp, (int, float)):
+            self.readings['temp_gpu_C'].append(temp)
+        if isinstance(mem_used, (int, float)):
+            self.readings['mem_used_MB'].append(mem_used)
+
         return {
             "vendor": "Intel",
-            "model": "Intel_GPU",
+            "model": self._model,
             "device_id": self.idx,
             "hostname": self.hostname,
+            "serial": self._serial,
+            "sm_util": util,
+            "mem_util": mem_util,
+            "gpu_clock": freq,
+            "mem_clock": "N/A",
+            "power_W": power,
+            "temp_gpu_C": temp,
+            "mem_used_MB": mem_used,
+            "mem_total_MB": mem_total,
+            "mem_free_MB": mem_free,
+            "throttled": throttled,
+            "thermal_slowdown": thermal_slowdown,
         }
+
+    def get_stats(self, skip_first_n=0):
+        stats = {}
+        for key, vals in self.readings.items():
+            if vals:
+                stats[f"{key}_min"] = min(vals)
+                vals_for_mean = vals[skip_first_n:] if len(vals) > skip_first_n else vals
+                import statistics as _st
+                stats[f"{key}_mean"] = _st.mean(vals_for_mean)
+                stats[f"{key}_max"] = max(vals)
+        return stats
+
+    def reset_stats(self):
+        for key in self.readings:
+            self.readings[key] = []
+        self.throttle_detected = False
+        self.throttle_count = 0
+
+    def check_thermal_warnings(self, log=None, temp_warn=90.0, temp_critical=95.0, power_warn_pct=98.0):
+        warnings = {'thermal': [], 'power': [], 'throttle': []}
+        st = self.get_stats()
+        if 'temp_gpu_C_max' in st:
+            v = st['temp_gpu_C_max']
+            if v >= temp_critical:
+                m = f"[CRIT] GPU temperature reached {v}°C (limit: {temp_critical}°C)"
+                warnings['thermal'].append(m)
+                if log:
+                    log.error(m)
+            elif v >= temp_warn:
+                m = f"[WARN] GPU temperature reached {v}°C (approaching {temp_critical}°C limit)"
+                warnings['thermal'].append(m)
+                if log:
+                    log.warning(m)
+        if self.power_limit_W and 'power_W_max' in st:
+            pct = st['power_W_max'] / self.power_limit_W * 100
+            if pct >= power_warn_pct:
+                m = f"[WARN] Power limit reached: {st['power_W_max']:.0f}W / {self.power_limit_W:.0f}W ({pct:.1f}%)"
+                warnings['power'].append(m)
+                if log:
+                    log.warning(m)
+        if self.throttle_count > 0:
+            m = f"[WARN] Thermal throttling detected in {self.throttle_count} telemetry reading(s)"
+            warnings['throttle'].append(m)
+            if log:
+                log.warning(m)
+        return warnings
 
 
 # ── CPU fallback ───────────────────────────────────────────────────────
@@ -1104,6 +1545,28 @@ class CpuTelemetry(TelemetryBase):
 
 # ── Factory selecting best available backend ───────────────────────────
 def make_telemetry(index: int, device: torch.device) -> TelemetryBase:
+    # Prefer Intel path when xpu-smi or torch.xpu is present; IntelTelemetry
+    # itself falls back through torch.xpu / sysfs when xpu-smi is absent.
+    def _xpu_smi_present():
+        if shutil.which("xpu-smi"):
+            return True
+        import os as _os
+        for _cand in ("/opt/aurora/26.181.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.3.5-vbpc5vu/bin/xpu-smi",
+                     "/opt/aurora/26.26.0/spack/unified/1.1.1/install/linux-x86_64/xpu-smi-1.3.5-yg43zwe/bin/xpu-smi"):
+            if _os.path.exists(_cand):
+                return True
+        try:
+            import torch as _t
+            if hasattr(_t, "xpu") and _t.xpu.is_available():
+                return True
+        except Exception:
+            pass
+        return False
+    if _xpu_smi_present():
+        try:
+            return IntelTelemetry(index)
+        except Exception as e:
+            print(f"Warning: Could not initialize Intel telemetry: {e}")
     if shutil.which("nvidia-smi") and not shutil.which("rocm-smi"):
         try:
             import pynvml
@@ -1117,7 +1580,10 @@ def make_telemetry(index: int, device: torch.device) -> TelemetryBase:
             print(f"Warning: Could not load AMD telemetry: {e}")
             pass
     if device.type == "xpu":
-        return IntelTelemetry(index)
+        try:
+            return IntelTelemetry(index)
+        except Exception as e:
+            print(f"Warning: Could not initialize Intel telemetry: {e}")
     return CpuTelemetry(index)
 
 
@@ -1363,28 +1829,40 @@ class VerbosePrinter:
 # ───────────────────────────────────────────────────────────────────────
 # 3.  TIMER  ───────────────────────────────────────────────────────────
 class Timer:
-    """CUDA events for GPU, perf_counter for CPU."""
+    """CUDA/XPU events for GPU, perf_counter for CPU."""
 
     def __init__(self, device: torch.device):
-        self.cuda = device.type == "cuda"
-        if self.cuda:
-            self.s = torch.cuda.Event(enable_timing=True)
-            self.e = torch.cuda.Event(enable_timing=True)
+        self.accel = _is_accelerator(device)
+        self.cuda = device.type == "cuda"  # compat alias for existing tests
+        self.device = device
+        if self.accel:
+            if device.type == "xpu" and hasattr(torch, "xpu"):
+                self.s = torch.xpu.Event(enable_timing=True)
+                self.e = torch.xpu.Event(enable_timing=True)
+            else:
+                self.s = torch.cuda.Event(enable_timing=True)
+                self.e = torch.cuda.Event(enable_timing=True)
 
     def __enter__(self):
-        if self.cuda:
+        if self.accel:
             self.s.record()
         else:
             self.t0 = time.perf_counter()
         return self
 
     def __exit__(self, *_):
-        if self.cuda:
+        if self.accel:
             self.e.record()
             self.e.synchronize()
             # Explicit sync for ROCm/HIP - events don't imply host sync like CUDA
-            if torch.version.hip:
-                torch.cuda.synchronize()
+            if getattr(torch.version, "hip", None):
+                _synchronize(dev)
+            # XPU events also benefit from explicit device synchronize on some drivers
+            if self.device.type == "xpu" and hasattr(torch, "xpu"):
+                try:
+                    torch.xpu.synchronize()
+                except Exception:
+                    pass
             self.elapsed = self.s.elapsed_time(self.e) / 1e3
         else:
             self.elapsed = time.perf_counter() - self.t0
@@ -1406,7 +1884,7 @@ def _format_telemetry_compact(tel_data: Dict[str, Any]) -> str:
     model = tel_data.get('model', '')
     
     # Determine appropriate label
-    if vendor in ('NVIDIA Corporation', 'Advanced Micro Devices, Inc. [AMD/ATI]', 'NVIDIA', 'AMD'):
+    if vendor in ('NVIDIA Corporation', 'Advanced Micro Devices, Inc. [AMD/ATI]', 'NVIDIA', 'AMD', 'Intel'):
         parts.append(f"GPU{device_id}")
     elif vendor in ('CPU', 'GenuineIntel', 'AuthenticAMD') or \
          'arm' in model.lower() or 'x86' in model.lower() or \
@@ -2235,8 +2713,8 @@ def device_label(device: torch.device, index: Any = 0) -> str:
         "MPS" for Apple Metal
         "CPU" for CPU-only mode
     """
-    if device.type == "cuda":
-        # Prefer device.index (set by torch.device('cuda:N')) over telemetry-derived index
+    if device.type in ("cuda", "xpu"):
+        # Prefer device.index (set by torch.device('cuda:N'/'xpu:N')) over telemetry-derived index
         # This avoids race conditions with background telemetry thread and
         # incorrect device_id from AMD amdsmi handle ordering in multi-process runs
         if device.index is not None:
@@ -2323,6 +2801,48 @@ def get_gpu_numa_node(gpu_index: int) -> int:
         except Exception:
             pass
     
+    # Intel XPU: try xpu-smi topology -j first (CPU Affinity per GPU)
+    if shutil.which("xpu-smi"):
+        try:
+            result = subprocess.run(["xpu-smi", "topology", "-j"], capture_output=True, text=True, timeout=3)
+            if result.returncode == 0 and result.stdout.strip():
+                import json as _js
+                data = _js.loads(result.stdout)
+                # topology -j varies: list of {device_id, cpu_affinity} or {topology: [...]}
+                entries = data.get("topology") or data.get("device_list") or (data if isinstance(data, list) else [])
+                for entry in entries:
+                    did = entry.get("device_id", entry.get("id", entry.get("Device ID")))
+                    if str(did) == str(gpu_index):
+                        aff = entry.get("cpu_affinity", entry.get("CPU Affinity", entry.get("Local CPU List", "")))
+                        if aff:
+                            # CPU affinity like "0-23,48-71" -> infer NUMA from first CPU's node
+                            first_cpu = str(aff).split(",")[0].split("-")[0].strip()
+                            try:
+                                cpu = int(first_cpu)
+                                for node in range(8):  # probe up to 8 NUMA nodes
+                                    cpulist_path = f"/sys/devices/system/node/node{node}/cpulist"
+                                    if os.path.exists(cpulist_path):
+                                        with open(cpulist_path) as f:
+                                            nodes = []
+                                            for part in f.read().strip().split(","):
+                                                if "-" in part:
+                                                    s,e = map(int, part.split("-"))
+                                                    nodes.extend(range(s,e+1))
+                                                elif part.strip():
+                                                    nodes.append(int(part.strip()))
+                                            if cpu in nodes:
+                                                return node
+                            except Exception:
+                                pass
+                        # if topology entry has explicit numa node
+                        for k in ("numa_node", "NUMA", "numa"):
+                            if k in entry:
+                                try:
+                                    return int(entry[k])
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
     return 0  # Default to NUMA node 0
 
 
@@ -2594,28 +3114,22 @@ def setup_cpu_threading(device: torch.device, args, log) -> None:
 
 
 def get_available_memory_mb(device: torch.device) -> float:
-    """Get available GPU memory in MB (portable across CUDA/ROCm/MPS)."""
-    if device.type == "cuda":
+    """Get available GPU memory in MB (portable across CUDA/ROCm/MPS/XPU)."""
+    if device.type in ("cuda", "xpu"):
         try:
-            # Clear PyTorch cache first to get accurate reading
-            torch.cuda.empty_cache()
-            free_mem, total_mem = torch.cuda.mem_get_info(device.index)
+            _empty_cache(device)
+            free_mem, total_mem = _mem_get_info(device)
             free_mb = free_mem / 1024**2
             total_mb = total_mem / 1024**2
-            
-            # Use whichever is smaller: configured ratio of total OR free memory
-            # This handles cases where memory is already allocated
             conservative_total = total_mb * MEMORY_TOTAL_CAPACITY_RATIO
             return min(conservative_total, free_mb * MEMORY_FREE_USAGE_RATIO)
         except Exception:
-            # Fallback: total memory with conservative margin
             try:
-                total = torch.cuda.get_device_properties(device.index).total_memory / 1024**2
+                total = _get_device_properties(device).total_memory / 1024**2
                 return total * MEMORY_TOTAL_CAPACITY_RATIO
             except Exception:
                 return MEMORY_DEFAULT_FALLBACK_MB
     elif device.type == "mps":
-        # Apple Metal - no direct query, use conservative estimate
         return MEMORY_DEFAULT_MPS_MB
     else:
         return MEMORY_DEFAULT_CPU_MB
@@ -3338,8 +3852,13 @@ class _HostReloadCoolGap:
         operand = cycle % 2
         target = self._targets[operand]
         target.copy_(self._host[operand], non_blocking=True)
-        if target.is_cuda:
+        if getattr(target, "is_cuda", False):
             torch.cuda.synchronize()
+        elif getattr(target, "is_xpu", False) and hasattr(torch, "xpu"):
+            try:
+                torch.xpu.synchronize()
+            except Exception:
+                pass
 
     def release(self) -> None:
         self._host = []
@@ -3348,7 +3867,7 @@ class _HostReloadCoolGap:
 
 def _make_melt_cool_gap(A, Bm, dev, log, tag: str):
     """Pick the cool-gap strategy for *dev* and log which one is in use."""
-    if dev.type != "cuda":
+    if dev.type not in ("cuda", "xpu"):
         log.info(f"{tag} Cool gap: in-place uniform_() refill ({dev.type} has no host→device path)")
         return _InPlaceCoolGap(A, Bm)
     try:
@@ -3773,8 +4292,7 @@ def _release_melt_workload(workload: Optional[_MeltWorkload], dev) -> None:
     if workload is None:
         return
     workload.release()
-    if dev.type == "cuda":
-        torch.cuda.empty_cache()
+    _empty_cache(dev)
 
 
 def convolution_test(a, dev, log, tel, tel_thread, prn):
@@ -3861,8 +4379,8 @@ def fft_test(a, dev, log, tel, tel_thread, prn):
         # offers), so skip gracefully instead of crashing mid-run.  (GitHub issue #45)
         try:
             torch.fft.fftn(torch.rand(2, 2, 2, device=dev, dtype=dtype))
-            if dev.type == "cuda":
-                torch.cuda.empty_cache()
+            if _is_accelerator(dev):
+                _empty_cache(dev)
         except (RuntimeError, NotImplementedError, TypeError) as e:
             reason = " ".join(str(e).split())
             log.warning(f"[{dev_lbl} 3-D FFT] dtype {dtype_str} not supported for FFT on this device: {reason}; skipping")
@@ -4164,8 +4682,8 @@ def schrodinger_equation(a, dev, log, tel, tel_thread, prn):
             ψp += 0.1 * (-1j * ((ψp.roll(-1, 0) - 2 * ψp + ψp.roll(1, 0)) + ψp))
             complex_dtype_str = str(ψp.dtype).split(".")[-1]
             del xp, ψp
-            if dev.type == "cuda":
-                torch.cuda.empty_cache()
+            if _is_accelerator(dev):
+                _empty_cache(dev)
         except (RuntimeError, NotImplementedError, TypeError) as e:
             reason = " ".join(str(e).split())
             log.warning(f"[{dev_lbl} Schrödinger Equation] dtype {dtype_str} not supported for complex wave-function "
@@ -4255,8 +4773,8 @@ def atomic_contention_test(a, dev, log, tel, tel_thread, prn):
             test_src = torch.ones(10, device=dev, dtype=dtype)
             test_tensor.scatter_add_(0, test_idx, test_src)
             del test_tensor, test_idx, test_src
-            if dev.type == "cuda":
-                torch.cuda.empty_cache()
+            if _is_accelerator(dev):
+                _empty_cache(dev)
         except (RuntimeError, TypeError) as e:
             log.warning(f"[{dev_lbl} Atomic Contention] dtype {dtype_str} not supported on this device: {e}")
             return None
@@ -4270,7 +4788,7 @@ def atomic_contention_test(a, dev, log, tel, tel_thread, prn):
         
         if dev.type == "cuda":
             try:
-                free_mb = torch.cuda.mem_get_info(dev.index if dev.index is not None else 0)[0] / 1024**2
+                free_mb = _mem_get_info(dev)[0] / 1024**2
                 if est_total_mb * 1.2 > free_mb:  # 20% safety margin
                     log.warning(f"[{dev_lbl} Atomic Contention] Estimated memory {est_total_mb:.0f}MB exceeds available {free_mb:.0f}MB, skipping")
                     return None
@@ -4294,8 +4812,8 @@ def atomic_contention_test(a, dev, log, tel, tel_thread, prn):
         for _ in range(a.warmup):
             target.zero_()
             target.scatter_add_(0, indices, src)
-            if dev.type == "cuda":
-                torch.cuda.synchronize()
+            if _is_accelerator(dev):
+                _synchronize(dev)
         log.info(f"[{dev_lbl} Atomic] Starting timed iterations...")
         
         tel_thread.set_active(True)
@@ -4373,7 +4891,7 @@ def sparse_mm_test(a, dev, log, tel, tel_thread, prn):
         # Check available memory
         if dev.type == "cuda":
             try:
-                free_mb = torch.cuda.mem_get_info(dev.index if dev.index is not None else 0)[0] / 1024**2
+                free_mb = _mem_get_info(dev)[0] / 1024**2
                 if total_est_mb > free_mb * 0.90:  # 90% of free memory
                     log.error(f"[{dev_lbl} Sparse MM] Estimated memory {total_est_mb:.0f}MB exceeds available {free_mb:.0f}MB, skipping")
                     log.error(f"[{dev_lbl} Sparse MM] Try smaller sizes: --sparse-m/n/k or use --stress-test for auto-sizing")
@@ -4396,8 +4914,8 @@ def sparse_mm_test(a, dev, log, tel, tel_thread, prn):
                 test_dense = torch.ones(2, 2, device=dev, dtype=dtype)
                 _ = torch.sparse.mm(test_sparse, test_dense)
                 del test_sparse, test_dense, test_indices, test_values
-                if dev.type == "cuda":
-                    torch.cuda.empty_cache()
+                if _is_accelerator(dev):
+                    _empty_cache(dev)
                 supported_dtypes.add(dtype)  # It works!
             except (RuntimeError, TypeError):
                 pass  # dtype not supported
@@ -4435,8 +4953,8 @@ def sparse_mm_test(a, dev, log, tel, tel_thread, prn):
         for wi in range(a.warmup):
             log.info(f"[{dev_lbl} Sparse MM] Warmup iteration {wi+1}/{a.warmup}...")
             _ = torch.sparse.mm(sparse_A, dense_B)
-            if dev.type == "cuda":
-                torch.cuda.synchronize()
+            if _is_accelerator(dev):
+                _synchronize(dev)
         log.info(f"[{dev_lbl} Sparse MM] Warmup complete, starting timed iterations...")
         
         # Effective FLOPS: 2 * nnz * N (each non-zero contributes 2 ops per output column)
@@ -5061,6 +5579,8 @@ def run_single_gpu(args, gpu_index: int, log=None):
     # (Before we have the actual torch.device object)
     if torch.cuda.is_available():
         early_label = f"GPU{gpu_index}"
+    elif _xpu_available():
+        early_label = f"GPU{gpu_index}"
     elif torch.backends.mps.is_available():
         early_label = "MPS"
     else:
@@ -5092,6 +5612,12 @@ def run_single_gpu(args, gpu_index: int, log=None):
     if torch.cuda.is_available():
         dev = torch.device(f"cuda:{gpu_index}")
         torch.cuda.set_device(gpu_index)
+    elif _xpu_available():
+        dev = torch.device(f"xpu:{gpu_index}")
+        try:
+            torch.xpu.set_device(gpu_index)
+        except Exception:
+            pass
     elif torch.backends.mps.is_available():
         dev = torch.device("mps")
     else:
@@ -5125,10 +5651,9 @@ def run_single_gpu(args, gpu_index: int, log=None):
     # Log NUMA topology for debugging multi-GPU performance issues
     numa_node = get_gpu_numa_node(gpu_index)
     numa_cpus = get_numa_cpus(numa_node)
-    if dev.type == "cuda":
+    if _is_accelerator(dev):
         log.info(f"  NUMA: GPU {gpu_index} on NUMA node {numa_node}, CPUs: {format_cpu_list(numa_cpus)}")
     else:
-        # CPU or MPS mode - NUMA info is about the CPU topology, not GPU
         log.info(f"  NUMA: node {numa_node}, CPUs: {format_cpu_list(numa_cpus)}")
     
     # Handle CPU affinity
@@ -5418,10 +5943,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = melt_test(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5452,10 +5977,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = batched_gemm_test(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5485,10 +6010,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = convolution_test(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5514,10 +6039,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = fft_test(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5543,10 +6068,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = einsum_test(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5570,10 +6095,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = memory_traffic_test(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5599,10 +6124,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = laplacian_heat_equation(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5624,10 +6149,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = schrodinger_equation(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5651,10 +6176,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = atomic_contention_test(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5680,10 +6205,10 @@ def run_single_gpu(args, gpu_index: int, log=None):
                     tel.reset_stats()
                     perf = sparse_mm_test(args, dev, log, tel, tel_thread, prn)
                     
-                    # Free GPU memory
-                    if dev.type == "cuda":
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                    # Free accelerator memory
+                    if _is_accelerator(dev):
+                        _empty_cache(dev)
+                        _synchronize(dev)
                     
                     if perf:
                         benchmark_results.append(perf)
@@ -5928,6 +6453,9 @@ def main():
     if args.all_gpus and torch.cuda.is_available():
         gpu_indices = list(range(torch.cuda.device_count()))
         log.info(f"Running on all {len(gpu_indices)} GPUs")
+    elif args.all_gpus and _xpu_available():
+        gpu_indices = list(range(torch.xpu.device_count()))
+        log.info(f"Running on all {len(gpu_indices)} XPU devices")
     elif args.gpu_list:
         gpu_indices = [int(x.strip()) for x in args.gpu_list.split(',')]
         log.info(f"Running on GPUs: {gpu_indices}")
@@ -5936,6 +6464,8 @@ def main():
         # Device-aware logging
         if torch.cuda.is_available():
             log.info(f"Running on single GPU: {args.device_index}")
+        elif _xpu_available():
+            log.info(f"Running on single XPU: {args.device_index}")
         elif torch.backends.mps.is_available():
             log.info("Running on MPS (Apple Metal)")
         else:
